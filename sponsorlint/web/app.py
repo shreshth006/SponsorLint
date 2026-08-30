@@ -24,6 +24,15 @@ from fastapi.templating import Jinja2Templates
 from pydantic import ValidationError
 from starlette.concurrency import run_in_threadpool
 
+from ..autopilot import (
+    AutopilotError,
+    AutopilotRun,
+    SpecBindingError,
+    confirm_manual_item,
+    start_run,
+    stop_run,
+    verify_retake,
+)
 from ..lint.engine import run
 from ..models import Spec, SpecError, Transcript
 from ..report.render import report_context
@@ -53,6 +62,12 @@ templates = Jinja2Templates(directory=str(HERE / "templates"))
 SPECS: dict[str, Spec] = {}
 REPORTS: dict[str, dict] = {}
 REPORT_TRANSCRIPTS: dict[str, Transcript] = {}
+#: report id -> the spec id that produced it. Autopilot binds a run from this
+#: rather than from a spec the browser hands back, so a run cannot be started
+#: against a specification the report was never verified under.
+REPORT_SPEC_IDS: dict[str, str] = {}
+#: uuid -> AutopilotRun. Same bounded, process-local store as everything else.
+RUNS: dict[str, AutopilotRun] = {}
 
 
 @app.middleware("http")
@@ -224,6 +239,7 @@ async def verify(
     context = report_context(report)
     _remember(REPORTS, report_id, context)
     _remember(REPORT_TRANSCRIPTS, report_id, transcript)
+    _remember(REPORT_SPEC_IDS, report_id, spec_id)
     return {"report_id": report_id, "report": context}
 
 
@@ -363,11 +379,162 @@ async def confirm_manual(report_id: str, payload: dict):
     _remember(SPECS, spec_id, spec)
     _remember(REPORTS, next_report_id, context)
     _remember(REPORT_TRANSCRIPTS, next_report_id, transcript)
+    _remember(REPORT_SPEC_IDS, next_report_id, spec_id)
     return {
         "spec_id": spec_id,
         "report_id": next_report_id,
         "report": context,
     }
+
+
+# --------------------------------------------------------------------------
+# autopilot — the bounded retake loop
+#
+# Five routes, no new persistence, no new dependency. Every one of them ends by
+# returning `run.view()`, which is assembled from state the controller wrote
+# during a real transition. The browser renders that view and computes nothing.
+# --------------------------------------------------------------------------
+
+
+def _run_or_404(run_id: str) -> AutopilotRun:
+    run = RUNS.get(run_id)
+    if run is None:
+        raise HTTPException(
+            404,
+            "That Autopilot run is no longer in memory. Verify the cut again "
+            "and start a new run.",
+        )
+    return run
+
+
+def _bound_spec(run: AutopilotRun) -> Spec | None:
+    """The live spec the run was opened against, if it is still in memory.
+
+    Handing this to the controller is what makes the fingerprint check bite: a
+    specification edited after the run started stops the run instead of
+    quietly continuing under a different contract.
+    """
+    return SPECS.get(run.spec_id)
+
+
+@app.post("/api/autopilot/start")
+async def autopilot_start(payload: dict):
+    """Open a bounded retake run from a report that already exists."""
+    report_id = payload.get("report_id")
+    if not isinstance(report_id, str) or not report_id:
+        raise HTTPException(400, "Supply the id of the report to work from.")
+
+    context = REPORTS.get(report_id)
+    transcript = REPORT_TRANSCRIPTS.get(report_id)
+    spec_id = REPORT_SPEC_IDS.get(report_id)
+    if context is None or transcript is None or spec_id is None:
+        raise HTTPException(
+            404,
+            "That verification run is no longer in memory. Check the cut again "
+            "before starting Autopilot.",
+        )
+
+    spec = SPECS.get(spec_id)
+    if spec is None:
+        raise HTTPException(
+            404,
+            "The approved specification behind that report is no longer in "
+            "memory. Approve it again and re-verify the cut.",
+        )
+
+    try:
+        run = await run_in_threadpool(
+            start_run,
+            spec,
+            transcript,
+            spec_id=spec_id,
+            source_report_id=report_id,
+            source_report_status=context.get("status"),
+        )
+    except SpecBindingError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except AutopilotError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except SpecError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+    _remember(RUNS, run.run_id, run)
+    return {"run_id": run.run_id, "run": run.view()}
+
+
+@app.get("/api/autopilot/{run_id}")
+async def autopilot_get(run_id: str):
+    return {"run_id": run_id, "run": _run_or_404(run_id).view()}
+
+
+@app.post("/api/autopilot/{run_id}/verify-retake")
+async def autopilot_verify_retake(
+    run_id: str,
+    take: str = Form(""),
+    video: UploadFile | None = None,
+):
+    """Verify a take the creator actually supplied.
+
+    Identical media handling to `/api/verify` — a committed take or a real
+    transcription. Autopilot neither records nor edits what arrives here.
+    """
+    run = _run_or_404(run_id)
+
+    if video is not None and video.filename:
+        transcript = await _transcribe_upload(video)
+        label = Path((video.filename or "upload").replace("\\", "/")).name
+    elif take:
+        transcript = _load_take(take)
+        label = take
+    else:
+        raise HTTPException(400, "Choose a recorded take or upload a video file.")
+
+    try:
+        LOGGER.info("autopilot verifier started")
+        await run_in_threadpool(
+            verify_retake, run, transcript, take=label, live_spec=_bound_spec(run)
+        )
+        LOGGER.info("autopilot verifier completed")
+    except SpecBindingError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except AutopilotError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except SpecError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+    return {"run_id": run.run_id, "run": run.view()}
+
+
+@app.post("/api/autopilot/{run_id}/confirm-manual")
+async def autopilot_confirm_manual(run_id: str, payload: dict):
+    """A human confirms one visual item. The verifier decides what follows."""
+    run = _run_or_404(run_id)
+    index = payload.get("index")
+    if isinstance(index, bool) or not isinstance(index, int):
+        raise HTTPException(400, "Choose a valid manual-review item.")
+
+    try:
+        await run_in_threadpool(
+            confirm_manual_item, run, index, live_spec=_bound_spec(run)
+        )
+    except SpecBindingError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except AutopilotError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except SpecError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+    return {"run_id": run.run_id, "run": run.view()}
+
+
+@app.post("/api/autopilot/{run_id}/stop")
+async def autopilot_stop(run_id: str, payload: dict | None = None):
+    run = _run_or_404(run_id)
+    reason = (payload or {}).get("reason") or "Stopped by the operator."
+    if not isinstance(reason, str):
+        raise HTTPException(400, "The stop reason must be text.")
+    stop_run(run, reason.strip()[:200] or "Stopped by the operator.")
+    return {"run_id": run.run_id, "run": run.view()}
 
 
 # --------------------------------------------------------------------------

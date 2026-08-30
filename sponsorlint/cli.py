@@ -31,13 +31,14 @@ USAGE = """SponsorLint — pre-flight QA for sponsored YouTube integrations.
   python -m sponsorlint demo                    zero-key demo on the committed campaign
   python -m sponsorlint demo --arc              compare the V1 and V3 verdicts
   python -m sponsorlint verify --spec S --transcript T
+  python -m sponsorlint autopilot               bounded retake loop over the committed takes
   python -m sponsorlint eval                    validator accuracy over labeled fixtures
   python -m sponsorlint compile BRIEF           brief -> proposed spec (needs an API key)
   python -m sponsorlint transcribe VIDEO        video -> transcript (needs ffmpeg)
   python -m sponsorlint serve                   the web UI
 
-Run from the repo root. `demo` and `eval` need no API key, no model download
-and no ffmpeg."""
+Run from the repo root. `demo`, `autopilot` and `eval` need no API key, no model
+download and no ffmpeg."""
 
 
 # --------------------------------------------------------------------------
@@ -61,6 +62,7 @@ def main(argv: list[str] | None = None) -> int:
     handlers = {
         "demo": _demo,
         "verify": _verify,
+        "autopilot": _autopilot,
         "eval": _eval,
         "compile": _compile,
         "transcribe": _transcribe,
@@ -168,6 +170,95 @@ def _verify(argv: list[str]) -> int:
 
     # Linter semantics: a blocking failure is a non-zero exit.
     return 1 if report.status == "DO_NOT_SEND" else 0
+
+
+# --------------------------------------------------------------------------
+# autopilot — the bounded retake loop, in the terminal
+# --------------------------------------------------------------------------
+
+
+def _autopilot(argv: list[str]) -> int:
+    """Drive one bounded run over committed takes and print the real trace.
+
+    Every line this prints is read back off the run the controller built. The
+    command supplies takes in the order given and stops when the controller
+    stops — it does not decide anything itself.
+    """
+    parser = argparse.ArgumentParser(prog="python -m sponsorlint autopilot")
+    parser.add_argument("--spec", help="approved specification (default: the sample campaign)")
+    parser.add_argument(
+        "--take",
+        action="append",
+        default=None,
+        metavar="TRANSCRIPT",
+        help="a take to verify, in order; repeatable (default: the sample V1 then V3)",
+    )
+    parser.add_argument(
+        "--confirm-manual",
+        action="store_true",
+        help="confirm outstanding manual-review items, as a human operator would",
+    )
+    parser.add_argument("--json", action="store_true", help="emit the run as JSON")
+    args = parser.parse_args(argv)
+
+    from .autopilot import confirm_manual_item, start_run, verify_retake
+    from .autopilot.models import STATE_LABEL
+
+    spec = _load_spec(Path(args.spec) if args.spec else SAMPLES / "spec.approved.json")
+    take_paths = (
+        [Path(t) for t in args.take]
+        if args.take
+        else [SAMPLES / "transcript.v1.json", SAMPLES / "transcript.v3.json"]
+    )
+
+    first, rest = take_paths[0], take_paths[1:]
+    run = start_run(
+        spec,
+        _load_transcript(first),
+        spec_id="cli",
+        source_report_id="cli-run",
+    )
+
+    for path in rest:
+        if not run.accepts_retake():
+            break
+        verify_retake(run, _load_transcript(path), take=path.name)
+
+    if args.confirm_manual and not run.is_terminal:
+        for index, item in enumerate(run.spec.manual_review):
+            if not item.confirmed:
+                confirm_manual_item(run, index)
+
+    if args.json:
+        print(json.dumps(run.view(), indent=2))
+        return 0
+
+    print()
+    print("  SPONSORLINT AUTOPILOT")
+    print(f"  {run.campaign}")
+    print(f"  spec binding {run.spec_fingerprint[:12]} · at most {run.max_iterations} iterations")
+    print("  " + "─" * 68)
+    for event in run.trace:
+        print(f"  {event.seq:>2}  [{event.state}] {event.action}")
+        print(f"      {event.message}")
+        if event.detail:
+            print(f"      · {event.detail}")
+        print()
+
+    print("  " + "─" * 68)
+    for record in run.history:
+        print(f"  iteration {record.iteration}  {record.take:<24} "
+              f"{record.score:>5}  {record.label}")
+    print("  " + "─" * 68)
+    print(f"  FINAL STATE   {run.state}  ({STATE_LABEL[run.state]})")
+    if run.finished_reason:
+        print(f"  REASON        {run.finished_reason}")
+    if run.plan and run.plan.items:
+        print(f"  OPEN ITEMS    {run.plan.summary()}")
+    print()
+
+    # Linter semantics, as `verify` has: an unfinished run is a non-zero exit.
+    return 0 if run.state == "COMPLETE" else 1
 
 
 # --------------------------------------------------------------------------

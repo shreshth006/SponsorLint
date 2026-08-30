@@ -16,6 +16,8 @@ const initialState = () => ({
   current: "upload",
   maxStep: 0,
   customBriefOpen: false,
+  autopilotRunId: null,
+  agentTake: "",
 });
 
 const state = initialState();
@@ -923,6 +925,8 @@ $("run-check").addEventListener("click", async () => {
     state.lastTake = video ? "upload" : take;
     state.lastReport = data.report;
     state.lastReportId = data.report_id;
+    state.autopilotRunId = null;
+    state.agentTake = "";
     state.maxStep = 3;
     renderReport(data.report);
     show("report");
@@ -944,7 +948,10 @@ function scoreWithPadding(score) {
 
 function renderReport(report) {
   if (!report) return;
-  $("report-context").textContent = state.lastTake === "upload" ? "Uploaded sponsor cut" : `${String(state.lastTake).toUpperCase()} / Aegis VPN sample`;
+  const campaign = report.campaign || "Sponsor integration preflight";
+  $("report-context").textContent = state.lastTake === "upload"
+    ? `Uploaded sponsor cut / ${campaign}`
+    : `${String(state.lastTake).toUpperCase()} / ${campaign}`;
   const verdict = $("verdict");
   verdict.innerHTML = "";
   const banner = el("section", `verdict verdict--${report.state_class}`);
@@ -1006,6 +1013,14 @@ function renderReport(report) {
     details.appendChild(list);
     host.appendChild(details);
   }
+
+  // Autopilot is offered whenever something is still outstanding, and stays on
+  // screen for the life of a run so the trace does not vanish at SPONSOR READY.
+  $("autopilot").hidden = !state.autopilotRunId && report.status === "SPONSOR_READY";
+  if (!state.autopilotRunId) {
+    $("autopilot-start").hidden = false;
+    $("autopilot-run").hidden = true;
+  }
 }
 
 function resultCard(result) {
@@ -1066,7 +1081,9 @@ function manualReportCard(item, index) {
     action.appendChild(el("p", null, "Inspect the actual video first. Confirmation changes the readiness verdict."));
     const button = el("button", "button button--primary", "Confirm manually");
     button.type = "button";
-    button.addEventListener("click", () => confirmManualFromReport(index, button));
+    button.addEventListener("click", () => (state.autopilotRunId
+      ? confirmManualFromAutopilot(index, button)
+      : confirmManualFromReport(index, button)));
     action.appendChild(button);
     card.appendChild(action);
   }
@@ -1123,6 +1140,309 @@ $("report-back").addEventListener("click", () => navigate("processing"));
 $("check-another").addEventListener("click", () => navigate("processing"));
 $("recheck").addEventListener("click", () => navigate("review"));
 
+/* ========================================================== Autopilot */
+/* The bounded retake loop. Every value rendered here arrives from
+   `run.view()`; this module computes no state, no verdict and no trace. */
+
+const AGENT_TONE = {
+  INSPECTING: "busy",
+  PLANNING: "busy",
+  VERIFYING_RETAKE: "busy",
+  WAITING_FOR_RETAKE: "waiting",
+  NEEDS_HUMAN_REVIEW: "human",
+  COMPLETE: "done",
+  ESCALATED: "escalated",
+  STOPPED: "stopped",
+};
+
+function agentBusy(busy, button, label) {
+  button.disabled = busy;
+  if (busy) {
+    button.dataset.idle = button.innerHTML;
+    button.textContent = label;
+  } else if (button.dataset.idle) {
+    button.innerHTML = button.dataset.idle;
+  }
+}
+
+function renderAutopilot(run) {
+  $("autopilot").hidden = false;
+  $("autopilot-start").hidden = true;
+  $("autopilot-run").hidden = false;
+
+  const tone = AGENT_TONE[run.state] || "busy";
+  $("agent-state").dataset.tone = tone;
+  $("agent-state-label").textContent = run.state_label;
+  $("agent-state-label").dataset.state = run.state;
+  $("agent-iteration").textContent = `${run.iteration} / ${run.max_iterations}`;
+  $("agent-binding").textContent = String(run.spec_fingerprint || "").slice(0, 12) || "—";
+  $("agent-runs").textContent = String(run.history.length);
+  $("autopilot-stop").hidden = run.is_terminal;
+
+  const reason = $("agent-reason");
+  reason.hidden = !run.finished_reason;
+  reason.textContent = run.finished_reason || "";
+
+  // With nothing left to re-record, the trace is the whole story; let it spread.
+  document.querySelector(".agent-grid").classList.toggle(
+    "agent-grid--trace-only", !run.plan || !run.plan.items.length,
+  );
+
+  renderAgentPlan(run);
+  renderAgentTrace(run.trace);
+  renderAgentHistory(run.history);
+
+  const retake = $("agent-retake");
+  retake.hidden = !run.accepts_retake;
+  if (!retake.hidden) renderAgentTakes();
+
+  persistState();
+}
+
+function renderAgentPlan(run) {
+  const host = $("agent-plan-items");
+  host.innerHTML = "";
+  const plan = run.plan;
+  $("agent-plan-summary").textContent = plan
+    ? `Iteration ${plan.iteration} · from ${plan.from_score} · ${plan.summary}`
+    : "";
+  if (!plan || !plan.items.length) {
+    host.appendChild(el("p", "trace-note", "Nothing outstanding on the last verified take."));
+    return;
+  }
+  plan.items.forEach((item) => host.appendChild(planItemCard(item)));
+}
+
+function planItemCard(item) {
+  const card = el("article", `plan-item plan-item--${item.requires_human ? "human" : "retake"}`);
+
+  const code = item.rule_id
+    ? `${String(item.rule_id).toUpperCase()} / ${String(item.rule_type).replaceAll("_", " ")}`
+    : "◇ HUMAN CHECK / VISUAL";
+  card.appendChild(el("p", "finding-code", code));
+
+  const head = el("div", "plan-head");
+  head.appendChild(el("span", "status-word", item.finding_status.replace("_", " ")));
+  head.appendChild(el("h4", null, item.finding_title || item.label));
+  head.appendChild(el("span", "plan-badge", item.requires_human ? "Human only" : "Re-record"));
+  card.appendChild(head);
+
+  if (item.expected || item.detected) {
+    const comparison = el("div", "comparison comparison--tight");
+    if (item.expected) {
+      const box = el("div");
+      box.appendChild(el("span", null, "Approved value"));
+      box.appendChild(el("strong", null, item.expected));
+      comparison.appendChild(box);
+    }
+    if (item.detected) {
+      const box = el("div", "detected-bad");
+      box.appendChild(el("span", null, "This take"));
+      box.appendChild(el("strong", null, item.detected));
+      comparison.appendChild(box);
+    }
+    card.appendChild(comparison);
+  }
+
+  if (item.evidence) {
+    card.appendChild(el("blockquote", "evidence-quote", `“${item.evidence}”`));
+  }
+
+  const action = el("div", "plan-action");
+  action.appendChild(el("span", null, "Recommended action"));
+  action.appendChild(el("p", null, item.recommended_action));
+  card.appendChild(action);
+
+  if (item.recording_note) card.appendChild(el("p", "advisory", item.recording_note));
+  if (item.escalation_reason) card.appendChild(el("p", "advisory advisory--escalate", item.escalation_reason));
+
+  const source = el("dl", "source-grounding");
+  source.appendChild(el("dt", null, "Source / brief"));
+  source.appendChild(el("dd", null, `“${item.source_quote}”`));
+  card.appendChild(source);
+  return card;
+}
+
+function renderAgentTrace(trace) {
+  const host = $("agent-trace-list");
+  host.innerHTML = "";
+  trace.forEach((event) => {
+    const row = el("li", "trace-row");
+    row.dataset.state = event.state;
+    const head = el("div", "trace-head");
+    head.appendChild(el("span", "trace-seq", String(event.seq).padStart(2, "0")));
+    head.appendChild(el("code", "trace-action", event.action));
+    head.appendChild(el("span", "trace-state", event.state.replaceAll("_", " ")));
+    row.appendChild(head);
+    row.appendChild(el("p", "trace-message", event.message));
+    if (event.detail) row.appendChild(el("p", "trace-detail", event.detail));
+    if (event.rule_ids.length) {
+      row.appendChild(el("p", "trace-rules", event.rule_ids.map((id) => id.toUpperCase()).join(" · ")));
+    }
+    host.appendChild(row);
+  });
+}
+
+function renderAgentHistory(history) {
+  const host = $("agent-history-list");
+  host.innerHTML = "";
+  history.forEach((record) => {
+    const row = el("li", "history-row");
+    row.appendChild(el("span", "history-index", `IT${record.iteration}`));
+    row.appendChild(el("strong", null, record.take));
+    row.appendChild(el("span", "history-score", record.score));
+    row.appendChild(el("span", `history-verdict history-verdict--${record.status.toLowerCase()}`, record.label));
+    host.appendChild(row);
+  });
+}
+
+function renderAgentTakes() {
+  const host = $("agent-take-options");
+  host.innerHTML = "";
+  if (!state.takes.length) {
+    host.appendChild(el("p", "take-empty", "No committed takes for this campaign. Upload the newly recorded cut below."));
+    return;
+  }
+  state.takes.forEach((take) => {
+    const card = el("label", "take-option");
+    card.dataset.takeId = take.id;
+    card.classList.toggle("is-selected", take.id === state.agentTake);
+    const radio = document.createElement("input");
+    radio.type = "radio";
+    radio.name = "agent-take";
+    radio.value = take.id;
+    radio.checked = take.id === state.agentTake;
+    radio.addEventListener("change", () => setAgentTake(take.id));
+    card.appendChild(radio);
+    card.appendChild(el("span", "take-index", take.id.toUpperCase()));
+    const copy = el("span", "take-copy");
+    copy.appendChild(el("strong", null, take.label));
+    copy.appendChild(el("small", null, "Committed transcript · verified by the same deterministic engine"));
+    card.appendChild(copy);
+    host.appendChild(card);
+  });
+  $("agent-take-summary").textContent =
+    state.takes.find((take) => take.id === state.agentTake)?.label || "Choose a take";
+}
+
+function setAgentTake(takeId) {
+  state.agentTake = takeId;
+  $("agent-video-file").value = "";
+  $("agent-video-name").textContent = "Real faster-whisper transcription";
+  document.querySelectorAll("#agent-take-options .take-option").forEach((item) => {
+    const selected = item.dataset.takeId === takeId;
+    item.classList.toggle("is-selected", selected);
+    item.querySelector("input").checked = selected;
+  });
+  $("agent-take-summary").textContent =
+    state.takes.find((take) => take.id === takeId)?.label || "Choose a take";
+  persistState();
+}
+
+async function autopilotCall(url, options, button, busyLabel) {
+  clearError();
+  agentBusy(true, button, busyLabel);
+  try {
+    const data = await call(url, options);
+    state.autopilotRunId = data.run_id;
+    const run = data.run;
+    if (run.latest_report) {
+      state.lastReport = run.latest_report;
+      state.lastReportId = run.latest_report_id;
+      renderReport(run.latest_report);
+    }
+    renderAutopilot(run);
+    return run;
+  } catch (error) {
+    fail(`${error.message}\nThe Autopilot run was not advanced. Nothing about the report changed.`);
+    return null;
+  } finally {
+    agentBusy(false, button, busyLabel);
+  }
+}
+
+$("autopilot-start").addEventListener("click", () => {
+  if (!state.lastReportId) {
+    fail("This report is no longer attached to a saved verification run. Check the cut again first.");
+    return;
+  }
+  state.agentTake = "";
+  autopilotCall(
+    "/api/autopilot/start",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ report_id: state.lastReportId }),
+    },
+    $("autopilot-start"),
+    "Inspecting and planning…",
+  ).then((run) => {
+    if (run) $("autopilot-title").scrollIntoView({ block: "start", behavior: "smooth" });
+  });
+});
+
+$("agent-video-file").addEventListener("change", () => {
+  const file = $("agent-video-file").files[0];
+  $("agent-video-name").textContent = file?.name || "Real faster-whisper transcription";
+  if (file) {
+    state.agentTake = "";
+    document.querySelectorAll("#agent-take-options .take-option").forEach((item) => item.classList.remove("is-selected"));
+    $("agent-take-summary").textContent = file.name;
+  }
+});
+
+$("agent-verify").addEventListener("click", () => {
+  const file = $("agent-video-file").files[0];
+  if (!file && !state.agentTake) {
+    fail("Select the take you actually recorded, or upload the new cut. Autopilot will not invent one.");
+    return;
+  }
+  const form = new FormData();
+  if (file) form.append("video", file);
+  else form.append("take", state.agentTake);
+  state.lastTake = file ? "upload" : state.agentTake;
+  autopilotCall(
+    `/api/autopilot/${encodeURIComponent(state.autopilotRunId)}/verify-retake`,
+    { method: "POST", body: form },
+    $("agent-verify"),
+    "Running the deterministic verifier…",
+  );
+});
+
+$("autopilot-stop").addEventListener("click", () => {
+  autopilotCall(
+    `/api/autopilot/${encodeURIComponent(state.autopilotRunId)}/stop`,
+    { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" },
+    $("autopilot-stop"),
+    "Stopping…",
+  );
+});
+
+async function confirmManualFromAutopilot(index, button) {
+  await autopilotCall(
+    `/api/autopilot/${encodeURIComponent(state.autopilotRunId)}/confirm-manual`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ index }),
+    },
+    button,
+    "Confirming and re-verifying…",
+  );
+}
+
+async function restoreAutopilot() {
+  if (!state.autopilotRunId) return;
+  try {
+    const data = await call(`/api/autopilot/${encodeURIComponent(state.autopilotRunId)}`);
+    renderAutopilot(data.run);
+  } catch (_) {
+    /* A restarted server clears the bounded run store; the report still stands. */
+    state.autopilotRunId = null;
+    persistState();
+  }
+}
+
 /* ============================================================= shell UX */
 
 document.querySelectorAll("[data-nav-step]").forEach((button) => {
@@ -1177,6 +1497,7 @@ $("brief-file").addEventListener("change", () => {
 });
 setupDropZone("brief-drop-zone", "brief-file");
 setupDropZone("video-drop-zone", "video-file");
+setupDropZone("agent-video-drop", "agent-video-file");
 
 /* ============================================================= bootstrap */
 
@@ -1191,6 +1512,7 @@ if (state.customBriefOpen) {
 if (state.spec) renderReview();
 if (state.specId) renderTakes();
 if (state.lastReport) renderReport(state.lastReport);
+restoreAutopilot();
 
 const requestedStep = HASH_STEP[location.hash.slice(1)] || state.current || "upload";
 const initialStep = canAccess(requestedStep) ? requestedStep : canAccess(state.current) ? state.current : "upload";

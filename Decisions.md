@@ -346,6 +346,49 @@ in the eval fixtures before it went in the normalizer.
 
 ---
 
+## D25 · Autopilot is a workflow controller, not a second verifier
+
+Aug 30, 2026. The retake loop added for the hackathon. The whole design question was where to put
+the agent so that adding it cannot weaken anything already here.
+
+**Decided — Autopilot gets four powers and no fifth.** Inspect a `Report`, write a checklist, call
+`lint.engine.run`, decide continue / escalate / stop. It has no route to a verdict: readiness
+arrives from the existing resolver already decided and is copied. A test walks the AST of every
+module in the package and fails on any *assignment* containing `SPONSOR_READY`; comparisons are
+fine, authorship is not.
+
+**The alternative we rejected — letting the agent adjust the spec toward what was recorded.** It is
+the obvious "helpful" behaviour and it is the one thing that would destroy the product. A tool whose
+expected values drift toward the take is not a verifier, it is a rubber stamp with extra steps. The
+planner therefore *restates* `rule.expected` and nothing else, and the run holds a deep copy of the
+spec plus a SHA-256 fingerprint of everything it is not allowed to change.
+
+**Decided — the fingerprint excludes `ManualReviewItem.confirmed`.** A human confirming a visual
+item is the one sanctioned mid-run change to a spec. Including the flag would have made the
+sanctioned path indistinguishable from tampering, and the fix for that would have been an exception
+in the tamper check — which is how tamper checks die. Excluding one field that only a human can set
+is narrower than excusing one code path.
+
+**Decided — three iterations, then a person.** Not "until it passes". An agent that keeps asking for
+retakes is the failure mode that makes people turn agents off; `ESCALATED` is a real outcome and a
+non-zero CLI exit, not an error state.
+
+**Decided — `WAITING_FOR_RETAKE` is a genuine stop, with no timer behind it.** There is no `step()`,
+no tick, no background task. The only way out is a call carrying a transcript a person supplied.
+This is what keeps "the agent produced a corrected take" from ever being true: Autopilot cannot
+write media, and editing a transcript and calling it a recording is the specific lie the state
+machine is shaped to make impossible.
+
+**Decided — `_transition` is the only writer of trace events.** Every visible line is appended at
+the moment the transition executes. A test asserts `run.trace.append` appears exactly once in the
+module. A trace assembled anywhere else is a story about work rather than a record of it, and the
+cheapest way to keep that honest is to leave only one door.
+
+**What would change our minds on the iteration bound:** evidence from real campaigns that a fourth
+cycle closes findings often enough to be worth the loop. That is a measurement; until then, three.
+
+---
+
 ## Open questions
 
 | Question | Owner | Resolve by |
