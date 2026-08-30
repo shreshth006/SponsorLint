@@ -22,6 +22,7 @@ DEMO_PATH = [
     "__main__.py",
     "cli.py",
     "models.py",
+    "autopilot/*.py",
     "lint/*.py",
     "normalize/*.py",
     "report/*.py",

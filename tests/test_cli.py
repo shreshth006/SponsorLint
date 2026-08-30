@@ -50,6 +50,41 @@ def test_compile_setup_error_is_readable(monkeypatch, capsys):
     assert "Traceback" not in error
 
 
+def test_autopilot_runs_the_committed_arc_without_a_key(capsys):
+    """The zero-key terminal proof: DO NOT SEND, a plan, a retake, a human gate."""
+    assert cli.main(["autopilot"]) == 1, "the run stops at the human check"
+    out = capsys.readouterr().out
+
+    assert "DO NOT SEND" in out and "REVIEW" in out
+    assert "SPONSORLINT AUTOPILOT" in out
+    assert "FINAL STATE   NEEDS_HUMAN_REVIEW" in out
+    assert "SPONSOR READY" not in out, "no human confirmed the visual item"
+
+    for action in ("bind_specification", "run_verifier", "build_retake_plan",
+                   "await_retake", "receive_retake", "compare_results"):
+        assert action in out
+
+
+def test_autopilot_reaches_complete_only_with_an_explicit_confirmation(capsys):
+    assert cli.main(["autopilot", "--confirm-manual"]) == 0
+    out = capsys.readouterr().out
+    assert "confirm_manual_item" in out
+    assert "FINAL STATE   COMPLETE" in out
+    assert "SPONSOR READY" in out
+
+
+def test_autopilot_emits_a_machine_readable_run(capsys):
+    import json
+
+    assert cli.main(["autopilot", "--json"]) in (0, 1)
+    run = json.loads(capsys.readouterr().out)
+    assert run["state"] == "NEEDS_HUMAN_REVIEW"
+    assert "spec" not in run
+    assert [event["seq"] for event in run["trace"]] == list(
+        range(1, len(run["trace"]) + 1)
+    )
+
+
 def test_analyze_side_door_is_not_a_command(capsys):
     assert cli.main(["analyze", "brief.md", "cut.mp4", "--yes"]) == 2
     error = capsys.readouterr().err

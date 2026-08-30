@@ -133,7 +133,7 @@ assertions the unit tests use — written once, used twice.
 
 ```bash
 python -m sponsorlint eval --verbose   # every case, pass or miss
-python -m pytest tests -q              # 203 passed, 1 intentional xfail
+python -m pytest tests -q              # 425 passed, 3 skipped, 1 intentional xfail
 ```
 
 ---
@@ -240,6 +240,115 @@ after the creator explicitly confirms it, all passing automated checks can resol
 
 ---
 
+## SponsorLint Autopilot
+
+> From a rejected sponsor cut to a verified retake.
+
+Added for the Agentic Day Online Hackathon. Everything above this section existed before it — the
+pre-Autopilot baseline is commit [`8fecaf9`](https://github.com/shreshth006/SponsorLint/commit/8fecaf9e23e71af8f5580ea80b5f2c99d7b1d062).
+
+### The problem it closes
+
+The verifier tells you a cut is not sendable. It does not tell you *what to record instead*, and it
+does not remember that you were mid-revision. The expensive part of a sponsor integration is the
+revision cycle: read the report, work out which of seven requirements moved, re-record, re-run,
+compare, discover you fixed two of three. Autopilot runs that loop as a bounded workflow.
+
+### The agent loop
+
+```
+Inspect the report  →  Plan the smallest safe retake  →  Wait for a real take
+        ↑                                                        │
+        │                                                        ▼
+   Another bounded iteration  ←  Observe & decide  ←  Run the deterministic verifier
+        │
+        └─→  COMPLETE (verifier said so) · NEEDS_HUMAN_REVIEW · ESCALATED (bound reached)
+```
+
+Eight explicit states — `INSPECTING`, `PLANNING`, `WAITING_FOR_RETAKE`, `VERIFYING_RETAKE`,
+`NEEDS_HUMAN_REVIEW`, `COMPLETE`, `ESCALATED`, `STOPPED` — and at most **three** verification cycles
+per run. Every trace line the UI shows was appended by the backend at the moment the transition
+executed; `_transition` is the only function that can write one, and a test asserts it stays that
+way.
+
+### The trust boundary, unchanged
+
+Autopilot is a workflow controller, not a second verifier and not an editor. It has four powers:
+inspect a `Report`, write a checklist, call `lint.engine.run`, and decide whether to continue,
+escalate or stop. It **cannot**:
+
+| | |
+|---|---|
+| edit the approved specification | the run holds a deep copy plus a SHA-256 fingerprint; an edited spec **stops** the run with a 409 |
+| change an expected value to match the recording | plan items copy `expected` out of the approved `Rule` — restating it is the point |
+| downgrade or suppress a failure | it never assigns a status; a test rejects any assignment of `SPONSOR_READY` anywhere in the package |
+| confirm a manual-review item | only an explicit human action reaches `confirm_manual_item`, and the verifier re-runs afterwards |
+| edit a transcript and call it a retake | it never writes media; a take arrives from a picker or an upload |
+| reach `SPONSOR_READY` by any other route | readiness is read off the report the existing resolver returned |
+
+The fingerprint deliberately excludes each manual item's `confirmed` flag — a human confirming a
+visual check is the one sanctioned mid-run change, and must not read as tampering.
+
+### Zero-key demo
+
+No API key, no model download, no ffmpeg, no network, no new dependency. The bundled V1 → V3
+campaign produces the whole arc from its own data:
+
+```
+V1   4/7   DO NOT SEND          3 failures → a 4-item plan (3 re-record, 1 human)
+V3   7/7   REVIEW               every automated rule passes; the visual item is still open
+     7/7   SPONSOR READY        only after a human confirms it
+```
+
+None of those numbers are written into the agent. A test greps the whole package for `aegis`,
+`shield mode`, `73%`, `70%` and the sample filenames, and fails if any appears.
+
+![The retake plan built from V1's real failures](docs/images/autopilot-plan.png)
+
+### Commands
+
+```bash
+python -m sponsorlint autopilot                    # the bounded loop, V1 then V3
+python -m sponsorlint autopilot --confirm-manual   # ...including the human confirmation
+python -m sponsorlint autopilot --json             # the run as JSON
+python -m sponsorlint autopilot --spec S --take T --take T2
+python -m sponsorlint serve                        # the browser flow (canonical)
+```
+
+`autopilot` exits `0` only when the run reached `COMPLETE`; an unfinished run is a non-zero exit,
+the same linter semantics `verify` uses.
+
+Five routes back the browser flow, on the same bounded in-memory store as everything else:
+
+```
+POST /api/autopilot/start                  report → a run bound to that report's spec
+GET  /api/autopilot/{run_id}               the run
+POST /api/autopilot/{run_id}/verify-retake a take the creator supplied
+POST /api/autopilot/{run_id}/confirm-manual a human closes one visual item
+POST /api/autopilot/{run_id}/stop          end the run; a stopped run never passes
+```
+
+The run's client view carries the spec **fingerprint**, never the spec and never the transcript.
+
+### Limitations
+
+- **It plans; it does not act on media.** No recording, no editing, no re-cutting, no video repair
+  of any kind. `WAITING_FOR_RETAKE` is a genuine stop: nothing advances until a person supplies a
+  take.
+- **Wording suggestions are drafts.** For a `MUST_NOT_SAY` finding it recommends removing the claim
+  and says explicitly that any replacement needs sponsor approval. It will not write a stronger
+  claim.
+- **Three iterations, then a person.** The bound is not tunable from the browser. A run that has not
+  closed by then escalates rather than looping.
+- **Bound to one specification for its lifetime.** Editing the approved spec mid-run is a hard stop,
+  not a migration. Approve the edit and start a new run.
+- **In-memory, process-local, evicted oldest-first**, like every other store here. Restarting the
+  server ends every run.
+- **A `DURATION` finding is reported, not solved.** It states the approved window and by how much
+  the take misses it. Length is a property of a recording.
+
+---
+
 ## Limitations
 
 Written by us, not discovered by you.
@@ -275,6 +384,7 @@ Written by us, not discovered by you.
 ```bash
 python -m sponsorlint demo                       # zero-key demo, committed campaign
 python -m sponsorlint demo --arc                 # DO NOT SEND → REVIEW
+python -m sponsorlint autopilot                  # the bounded retake loop
 python -m sponsorlint eval                       # validator metrics
 python -m sponsorlint verify --spec S --transcript T
 python -m sponsorlint serve                      # the web UI
@@ -316,6 +426,18 @@ Render's load balancer and `www` to the generated `onrender.com` hostname.
 The service is configured for `sponsorlint.xyz` and automatic deploys only
 after GitHub checks pass.
 
+## Provenance
+
+SponsorLint is a two-person project. `git shortlog` is the honest record:
+[@Harshyadav442277](https://github.com/Harshyadav442277) opened the repository and wrote the first
+commits; [@shreshth006](https://github.com/shreshth006) wrote the majority of what is here now.
+The CI badge at the top points at `Harshyadav442277/SponsorLint`, which is where the workflow was
+first configured; this working tree's `origin` is `shreshth006/SponsorLint`. Both are the same
+project, and neither is a re-publication of someone else's work.
+
+The **SponsorLint Autopilot** section is the hackathon contribution, added on top of commit
+`8fecaf9`. Everything else predates it.
+
 ## Layout
 
 ```
@@ -327,10 +449,12 @@ sponsorlint/
 ├── brief/               PDF extraction · the versioned compiler prompt
 ├── transcript/          faster-whisper · ffprobe
 ├── eval/                fixtures.json + the metrics runner
+├── autopilot/           the bounded retake loop — models · planner · controller
 ├── report/              ANSI terminal · web template context
 └── web/                 FastAPI + Jinja2 + vanilla JS, no build step
 samples/                 the committed Aegis VPN campaign
-tests/                   202 collected tests
+docs/                    Autopilot demo script · hackathon submission · Mel evidence
+tests/                   429 collected tests
 ```
 
 The brand, campaign, URL and promo code used by the project are fictional.

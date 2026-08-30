@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#0b0c0a">
   <title>SponsorLint — Verify before you send</title>
-  <link rel="stylesheet" href="../static/app.css?v=motion-lab-1">
+  <link rel="stylesheet" href="../static/app.css?v=autopilot-1">
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect width='16' height='16' rx='3' fill='%230b0c0a'/><path d='M4 8.5 7 11l5-7' fill='none' stroke='%23c6ff52' stroke-width='2'/></svg>">
 </head>
 <body>
@@ -248,6 +248,93 @@
         <div id="verdict"></div>
         <div id="findings"></div>
 
+        <!-- ================================================ 05 / AUTOPILOT -->
+        <section class="autopilot" id="autopilot" aria-labelledby="autopilot-title" hidden>
+          <div class="autopilot-intro">
+            <p class="eyebrow">05 / Autopilot</p>
+            <h2 id="autopilot-title">From a rejected sponsor cut<br>to a verified retake.</h2>
+            <p>Autopilot reads this report, writes the smallest safe retake plan, waits for a take
+              you actually record, and hands it back to the same deterministic verifier. It cannot
+              edit the approved spec, cannot soften a finding, and cannot confirm a human check.</p>
+            <button class="button button--primary button--large" id="autopilot-start" type="button">
+              Create retake plan <span aria-hidden="true">→</span>
+            </button>
+          </div>
+
+          <div class="autopilot-run" id="autopilot-run" hidden>
+            <header class="agent-bar">
+              <div class="agent-state" id="agent-state">
+                <span class="agent-dot" aria-hidden="true"></span>
+                <div>
+                  <span>Agent state</span>
+                  <strong id="agent-state-label">Inspecting report</strong>
+                </div>
+              </div>
+              <div class="agent-meta">
+                <div><span>Iteration</span><strong id="agent-iteration">1 / 3</strong></div>
+                <div><span>Spec binding</span><strong id="agent-binding" title="Fingerprint of the approved specification this run is frozen to">—</strong></div>
+                <div><span>Verifier runs</span><strong id="agent-runs">0</strong></div>
+              </div>
+              <button class="button button--quiet" id="autopilot-stop" type="button">Stop run</button>
+            </header>
+
+            <p class="agent-reason" id="agent-reason" hidden></p>
+
+            <div class="agent-grid">
+              <section class="agent-plan" aria-labelledby="agent-plan-title">
+                <div class="section-heading">
+                  <div>
+                    <p class="eyebrow">Recommended by the agent</p>
+                    <h3 id="agent-plan-title">Retake checklist</h3>
+                  </div>
+                  <p class="count-copy" id="agent-plan-summary"></p>
+                </div>
+                <div id="agent-plan-items"></div>
+              </section>
+
+              <aside class="agent-trace" aria-labelledby="agent-trace-title">
+                <div class="section-heading">
+                  <div>
+                    <p class="eyebrow">Executed transitions</p>
+                    <h3 id="agent-trace-title">Agent trace</h3>
+                  </div>
+                </div>
+                <p class="trace-note">Every line below was written by the backend as the transition
+                  happened. Nothing here is scripted or replayed.</p>
+                <ol class="trace-list" id="agent-trace-list"></ol>
+              </aside>
+            </div>
+
+            <section class="agent-retake" id="agent-retake" aria-labelledby="agent-retake-title" hidden>
+              <div class="section-heading">
+                <div>
+                  <p class="eyebrow">Supplied by the creator</p>
+                  <h3 id="agent-retake-title">Hand Autopilot a real new take</h3>
+                </div>
+                <p class="count-copy">Autopilot does not record, edit or repair media.</p>
+              </div>
+              <div class="take-options" id="agent-take-options"></div>
+              <label class="video-drop" id="agent-video-drop" for="agent-video-file">
+                <input class="file-input" type="file" id="agent-video-file" accept="video/*,audio/*">
+                <span class="video-drop-icon" aria-hidden="true">↥</span>
+                <span><strong>Or drop the newly recorded cut</strong><small id="agent-video-name">Real faster-whisper transcription</small></span>
+                <span class="drop-action">Choose media</span>
+              </label>
+              <div class="check-dock">
+                <div><span>New take</span><strong id="agent-take-summary">Choose a take</strong></div>
+                <button class="button button--primary button--large" id="agent-verify" type="button">
+                  Verify corrected take <span aria-hidden="true">→</span>
+                </button>
+              </div>
+            </section>
+
+            <section class="agent-history" aria-labelledby="agent-history-title">
+              <p class="eyebrow" id="agent-history-title">Proved by the verifier</p>
+              <ol class="history-list" id="agent-history-list"></ol>
+            </section>
+          </div>
+        </section>
+
         <div class="report-footer-actions">
           <button class="button button--quiet" id="recheck" type="button">Edit approved rules</button>
           <button class="button button--primary" id="check-another" type="button">Check another cut <span aria-hidden="true">→</span></button>
@@ -274,7 +361,7 @@
   </form>
 </dialog>
 
-<script src="../static/motion.js?v=motion-lab-1"></script>
-<script src="../static/app.js?v=motion-lab-1"></script>
+<script src="../static/motion.js?v=autopilot-1"></script>
+<script src="../static/app.js?v=autopilot-1"></script>
 </body>
 </html>
